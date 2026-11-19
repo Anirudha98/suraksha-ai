@@ -201,8 +201,11 @@ class OpenAIClient(LLMClient):
             return ""
         try:
             from openai import OpenAI  # optional dependency
+            # SDK default is a 10-minute wait with 2 retries; a slow free tier
+            # would freeze the chat. Give up after 60s and use the fallback.
             client = OpenAI(api_key=settings.openai_api_key,
-                            base_url=settings.openai_base_url or None)
+                            base_url=settings.openai_base_url or None,
+                            timeout=60, max_retries=1)
             resp = client.chat.completions.create(
                 model=settings.openai_model,
                 messages=[{"role": "system", "content": system},
