@@ -282,17 +282,70 @@ def answer_question(db, question: str, language: str | None = None, ctx=None) ->
     lang = language or _detect_lang(question)
     llm = get_llm()
 
-    if llm.provider == "catalyst" and hasattr(llm, "generate_query"):
-        return _glm_answer(db, question, lang, llm, ctx)
+    if hasattr(llm, "generate_query"):
+        if settings.use_catalyst:
+            return _glm_answer(db, question, lang, llm, ctx)
+        if settings.database_url.startswith("sqlite"):
+            return _glm_answer(db, question, lang, llm, ctx,
+                               run=_sqlite_query, schema=_sqlite_schema())
     return _fallback(db, question, lang, ctx, llm)
+
+
+# ── LLM-written SQL against local SQLite ──────────────────────────────
+# Credentials, chat history and the audit trail are never queryable.
+SQL_TABLES = ALLOWED_TABLES - {"users", "audit_logs", "conversations", "messages",
+                               "access_requests"}
+
+
+def _sqlite_schema() -> str:
+    from ..database import get_engine
+    with get_engine().connect() as con:
+        lines = []
+        for t in sorted(SQL_TABLES):
+            cols = [r[1] for r in con.exec_driver_sql(f"PRAGMA table_info({t})")]
+            if cols:
+                lines.append(f"TABLE {t}: {', '.join(cols)}")
+    rules = SCHEMA_CONTEXT[SCHEMA_CONTEXT.index("ZCQL RULES:"):].replace("ZCQL", "SQL")
+    return ("You have access to a crime intelligence SQLite database with these "
+            "tables (ROWID is an alias of id):\n\n" + "\n".join(lines) + "\n\n" + rules)
+
+
+def _sqlite_query(sql: str) -> list[dict]:
+    """Run LLM-written SQL on a read-only connection.
+
+    The authorizer is the real guard: validate_zcql is regex-based and a comma
+    join or subquery could slip a table past it. Here SQLite itself refuses any
+    read outside SQL_TABLES and anything that isn't a plain SELECT.
+    """
+    import sqlite3
+    from ..database import get_engine
+
+    def authorize(action, arg1, *_):
+        if action == sqlite3.SQLITE_READ:
+            return sqlite3.SQLITE_OK if arg1 in SQL_TABLES else sqlite3.SQLITE_DENY
+        if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_FUNCTION):
+            return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
+
+    path = get_engine().url.database
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    con.set_authorizer(authorize)
+    try:
+        return [dict(r) for r in con.execute(sql).fetchmany(500)]
+    finally:
+        con.close()
 
 
 # ── GLM-powered path ──────────────────────────────────────────────────
 
-def _glm_answer(db, question: str, lang: str, llm, ctx=None) -> dict:
-    from ..catalyst_store import get_store
+def _glm_answer(db, question: str, lang: str, llm, ctx=None,
+                run=None, schema: str = SCHEMA_CONTEXT) -> dict:
+    if run is None:
+        from ..catalyst_store import get_store
+        run = get_store().query
 
-    parsed = llm.generate_query(question, SCHEMA_CONTEXT)
+    parsed = llm.generate_query(question, schema)
 
     # GLM unreachable is not the same as GLM saying "I don't know" — degrade to
     # the rule-based engine instead of telling every user the question failed.
@@ -328,8 +381,7 @@ def _glm_answer(db, question: str, lang: str, llm, ctx=None) -> dict:
                       flags=re.IGNORECASE | re.DOTALL)
 
     try:
-        store = get_store()
-        rows = store.query(zcql)
+        rows = run(zcql)
     except Exception:
         return _fallback(db, question, lang, ctx, llm)
 
@@ -340,7 +392,7 @@ def _glm_answer(db, question: str, lang: str, llm, ctx=None) -> dict:
     if not rows and (_COUNT_RE.search(zcql) or _GROUP_BY_RE.search(zcql)):
         widened, inferred = _widen(zcql)
         if widened != zcql:
-            retry = store.query(widened)
+            retry = run(widened)
             if retry:
                 rows, zcql = retry, widened
                 group_col = group_col or inferred
@@ -383,7 +435,8 @@ def _glm_answer(db, question: str, lang: str, llm, ctx=None) -> dict:
 
     narrated = llm.narrate(question, findings, lang)
 
-    return _reply(intent, question, lang, narrated, zcql, evidence, data=data, llm=llm)
+    return _reply(intent, question, lang, narrated, zcql, evidence, data=data, llm=llm,
+                  narrated=True)
 
 
 # ── Rule-based path (original, zero-API-key) ──────────────────────────
@@ -655,10 +708,13 @@ def _reason_steps(intent, sql, evidence, provenance):
     ]
 
 
-def _reply(intent, question, lang, answer, sql, evidence, data=None, llm=None):
+def _reply(intent, question, lang, answer, sql, evidence, data=None, llm=None,
+           narrated=False):
     if llm is None:
         llm = get_llm()
-    narrated = answer if llm.provider == "catalyst" else llm.narrate(question, answer, lang)
+    if not narrated and llm.provider != "catalyst":
+        answer = llm.narrate(question, answer, lang)
+    narrated = answer
     provenance, confidence = PROVENANCE.get(intent, ("DATABASE_FACT", "Medium"))
     for e in evidence:
         e.setdefault("provenance", provenance)

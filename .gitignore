@@ -27,3 +27,6 @@ newcrime/backend/uploads/
 # built frontend staged for `catalyst deploy --only client`
 newcrime/backend/client/
 *.tsbuildinfo
+
+# frontend build copied in for local runs of the single-container setup
+newcrime/backend/static/

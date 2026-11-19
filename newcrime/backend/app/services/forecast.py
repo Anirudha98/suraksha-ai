@@ -1,70 +1,73 @@
-"""QuickML Prophet integration for crime forecasting.
+"""Crime forecasting from local case history (replaces QuickML Prophet).
 
-QuickML exposes one generic call — predict(endpoint_key, input_data) — against
-a *published endpoint*, not a model id. There is no app.quickml() and no
-model() accessor; earlier code called both and failed silently into an empty
-forecast.
+Fits a linear trend to daily case counts over the recent history window and
+projects it forward with a 95% band from the residual spread.
+
+ponytail: linear trend, no weekly/yearly seasonality. Swap in Prophet or
+statsmodels if the host has the RAM (Render free has 512 MB) and the data has
+enough history for seasonality to matter.
 """
 from __future__ import annotations
 
-from ..config import settings
+import statistics
+from collections import Counter
+from datetime import date, datetime, timedelta
 
-# Last failure, surfaced by /api/health. A forecast that silently returns []
-# is indistinguishable from one that legitimately has nothing to predict.
+# Last failure, surfaced by /api/health.
 last_error: str | None = None
 
+HISTORY_DAYS = 180
 
-def _predict(input_data: dict):
-    global last_error
-    if not settings.quickml_endpoint_key:
-        last_error = "QUICKML_ENDPOINT_KEY not set"
-        return None
+
+def _daily_counts(crime_type, district) -> tuple[list[int], date] | None:
+    from ..database import SessionLocal
+    from .. import models as m
+    db = SessionLocal()
     try:
-        from ..catalyst_ctx import init_sdk
-        result = init_sdk().quick_ml().predict(
-            settings.quickml_endpoint_key, input_data)
-        last_error = None
-        return result
-    except Exception as e:
-        last_error = f"{type(e).__name__}: {e}"[:300]
+        q = db.query(m.Case.occurrence_date).filter(m.Case.occurrence_date.isnot(None))
+        if crime_type:
+            q = q.filter(m.Case.crime_type == crime_type)
+        if district:
+            q = q.filter(m.Case.district == district)
+        days = [d.date() if isinstance(d, datetime) else d for (d,) in q.all()]
+        # anchor on the newest case overall, like Prophet's last `ds`
+        newest = db.query(m.Case.occurrence_date).order_by(
+            m.Case.occurrence_date.desc()).first()
+    finally:
+        db.close()
+    if not newest or not newest[0]:
         return None
+    end = newest[0].date() if isinstance(newest[0], datetime) else newest[0]
+    start = end - timedelta(days=HISTORY_DAYS - 1)
+    hits = Counter(d for d in days if start <= d <= end)
+    return [hits.get(start + timedelta(days=i), 0) for i in range(HISTORY_DAYS)], end
 
 
-def _rows(result) -> list[dict]:
-    """Normalise whatever shape the endpoint returns into forecast rows."""
-    if isinstance(result, dict):
-        for key in ("predictions", "forecast", "data", "result", "output"):
-            if isinstance(result.get(key), list):
-                result = result[key]
-                break
-    if not isinstance(result, list):
-        return []
+def project(counts: list[int], end: date, horizon_days: int) -> list[dict]:
+    xs = range(len(counts))
+    slope, intercept = statistics.linear_regression(xs, counts)
+    resid = [c - (slope * x + intercept) for x, c in zip(xs, counts)]
+    band = 1.96 * statistics.pstdev(resid)
     out = []
-    for row in result:
-        if not isinstance(row, dict):
-            continue
-        date = row.get("ds") or row.get("date")
-        value = row.get("yhat", row.get("predicted_count"))
-        if date is None or value is None:
-            continue
-        out.append({
-            "date": str(date)[:10],
-            "predicted_count": float(value),
-            "lower_bound": float(row.get("yhat_lower", row.get("lower_bound", value))),
-            "upper_bound": float(row.get("yhat_upper", row.get("upper_bound", value))),
-        })
+    for h in range(1, horizon_days + 1):
+        y = max(0.0, slope * (len(counts) - 1 + h) + intercept)
+        out.append({"date": (end + timedelta(days=h)).isoformat(),
+                    "predicted_count": round(y, 3),
+                    "lower_bound": round(max(0.0, y - band), 3),
+                    "upper_bound": round(y + band, 3)})
     return out
 
 
 def get_forecast(crime_type: str | None = None, district: str | None = None,
                  horizon_days: int = 30) -> list[dict]:
-    payload: dict = {"horizon": horizon_days}
-    if crime_type:
-        payload["crime_type"] = crime_type
-    if district:
-        payload["district"] = district
-    result = _predict(payload)
-    return _rows(result) if result is not None else []
+    global last_error
+    try:
+        hist = _daily_counts(crime_type, district)
+        last_error = None
+        return project(*hist, horizon_days) if hist else []
+    except Exception as e:
+        last_error = f"{type(e).__name__}: {e}"[:300]
+        return []
 
 
 def get_risk_assessment(district: str) -> dict:

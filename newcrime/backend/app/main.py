@@ -11,7 +11,9 @@ from .routers import (
     auth, cases, chat, analytics, network, profiling, socio, forecasting,
     financial, alerts, audit, dashboards, investigation, victims,
 )
-from .deps import get_ctx
+from fastapi import Depends
+
+from .deps import get_ctx, require_login
 
 
 def _ensure_seeded():
@@ -35,6 +37,9 @@ def _ensure_seeded():
 
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI):
+    if settings.secret_key == "dev-secret-change-me":
+        print("[startup] WARNING: SECRET_KEY is the default; login tokens are forgeable. "
+              "Set SECRET_KEY in the environment before exposing this server.")
     if settings.use_catalyst:
         from .catalyst_store import init_catalyst_store
         init_catalyst_store()
@@ -54,12 +59,20 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    for r in (auth, chat, cases, analytics, network, profiling, socio, forecasting,
+    application.include_router(auth.router)  # login + demo user list stay public
+    for r in (chat, cases, analytics, network, profiling, socio, forecasting,
               financial, alerts, audit, dashboards, investigation, victims):
-        application.include_router(r.router)
+        application.include_router(r.router, dependencies=[Depends(require_login)])
     application.middleware("http")(audit_mw)
     application.get("/api/health")(health)
-    application.get("/")(root)
+    # Serve the built frontend (Docker copies it to ./static) on the same origin.
+    import os
+    static = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+    if os.path.isdir(static):
+        from fastapi.staticfiles import StaticFiles
+        application.mount("/", StaticFiles(directory=static, html=True), name="ui")
+    else:
+        application.get("/")(root)
     return application
 
 

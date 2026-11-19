@@ -1,11 +1,11 @@
-"""Lightweight demo auth + RBAC (local only, not production-grade)."""
+"""Login: verifies the password and issues a signed token (see deps.py)."""
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..database import get_db
 from ..schemas import LoginRequest
-from ..deps import ROLE_MATRIX
+from ..deps import ROLE_MATRIX, check_password, hash_password, make_token
 from .. import models as m
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -17,14 +17,19 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
         from ..catalyst_store import get_store
         store = get_store()
         rows = store.query(f"SELECT * FROM users WHERE username = '{req.username}'")
-        if not rows or rows[0].get("password") != req.password:
+        if not rows or not check_password(req.password, rows[0].get("password") or ""):
             raise HTTPException(401, "invalid credentials")
-        return _user_payload_dict(rows[0])
+        payload = _user_payload_dict(rows[0])
+        return {**payload, "token": make_token(payload)}
 
     user = db.query(m.User).filter(m.User.username == req.username).first()
-    if not user or user.password != req.password:
+    if not user or not check_password(req.password, user.password):
         raise HTTPException(401, "invalid credentials")
-    return _user_payload(user)
+    if not user.password.startswith("pbkdf2$"):
+        user.password = hash_password(req.password)
+        db.commit()
+    payload = _user_payload(user)
+    return {**payload, "token": make_token(payload)}
 
 
 @router.get("/users")

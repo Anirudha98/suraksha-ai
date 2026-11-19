@@ -1,0 +1,7 @@
+**/node_modules
+**/dist
+**/.env
+newcrime/backend/uploads
+newcrime/backend/functions
+docs
+.git

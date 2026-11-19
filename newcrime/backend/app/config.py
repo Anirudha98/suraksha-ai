@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     catalyst_model: str = ""
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    # Any OpenAI-compatible API: Groq, Gemini, OpenRouter... blank = OpenAI.
+    openai_base_url: str = ""
 
     database_url: str = "sqlite:///./crimeintel.db"
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"

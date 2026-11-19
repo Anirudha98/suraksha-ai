@@ -26,7 +26,7 @@ class User(Base):
     username = Column(String(50), unique=True, nullable=False, index=True)
     full_name = Column(String(100))
     email = Column(String(120))
-    # NOTE: plaintext demo password (local only). Real deploy must hash.
+    # pbkdf2 hash (deps.hash_password); legacy plaintext rows rehash on login
     password = Column(String(255), nullable=False)
     # role in: investigator | analyst | supervisor | policymaker | admin
     role = Column(String(30), default="investigator", index=True)

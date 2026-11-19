@@ -1,12 +1,19 @@
-"""Request context: identifies the calling officer from headers.
+"""Request context: identifies the calling officer from a signed login token.
 
-This is a LOCAL prototype convenience -- the frontend sends the signed-in user's
-identity via headers (X-User-*). A production build would derive this from a
-verified session token. Used for PII masking, RBAC and audit logging.
+Login issues an HMAC-signed token carrying the officer's id, role and
+territory; every request is checked against SECRET_KEY, so a client can't
+claim a role it wasn't given. Used for PII masking, RBAC and audit logging.
 """
 from __future__ import annotations
 
-from fastapi import Request
+import base64
+import hashlib
+import hmac
+import json
+import os
+import time
+
+from fastapi import HTTPException, Request
 
 # role -> capability matrix (single source of truth, shared with auth router)
 # Full Karnataka State Police hierarchy
@@ -204,15 +211,69 @@ class Ctx:
         return list(set(own + neighbors))
 
 
+# ── tokens & passwords (stdlib only) ──────────────────────────────────
+TOKEN_TTL = 12 * 3600
+
+
+def _sign(body: str) -> str:
+    from .config import settings
+    return hmac.new(settings.secret_key.encode(), body.encode(), hashlib.sha256).hexdigest()
+
+
+def make_token(user: dict) -> str:
+    claims = {k: user.get(k) for k in
+              ("id", "full_name", "role", "district", "subdivision", "range_name")}
+    claims["exp"] = int(time.time()) + TOKEN_TTL
+    body = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode()
+    return f"{body}.{_sign(body)}"
+
+
+def read_token(token: str) -> dict | None:
+    body, _, sig = (token or "").partition(".")
+    if not body or not hmac.compare_digest(sig, _sign(body)):
+        return None
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(body))
+    except ValueError:
+        return None
+    return claims if claims.get("exp", 0) > time.time() else None
+
+
+def hash_password(pw: str) -> str:
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, 200_000)
+    return f"pbkdf2${salt.hex()}${dk.hex()}"
+
+
+def check_password(pw: str, stored: str) -> bool:
+    if not stored.startswith("pbkdf2$"):
+        # legacy plaintext row from an older DB; login rehashes it
+        return hmac.compare_digest(pw.encode(), stored.encode())
+    _, salt, digest = stored.split("$")
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 200_000)
+    return hmac.compare_digest(dk.hex(), digest)
+
+
 def get_ctx(request: Request) -> Ctx:
-    return Ctx(
-        request.headers.get("X-User-Id"),
-        request.headers.get("X-User-Name"),
-        request.headers.get("X-User-Role", DEFAULT_ROLE),
-        request.headers.get("X-User-District"),
-        request.headers.get("X-User-Subdivision"),
-        request.headers.get("X-User-Range"),
-    )
+    """401 unless the request carries a valid token.
+
+    The query-string form exists only for file downloads, which the browser
+    loads through <a>/<img>/<iframe> and so can't attach a header to.
+    """
+    auth = request.headers.get("authorization", "")
+    token = auth[7:] if auth.lower().startswith("bearer ") else ""
+    if not token and request.url.path.endswith("/download"):
+        token = request.query_params.get("token", "")
+    claims = read_token(token)
+    if claims is None:
+        raise HTTPException(401, "login required")
+    return Ctx(claims.get("id"), claims.get("full_name"), claims.get("role"),
+               claims.get("district"), claims.get("subdivision"),
+               claims.get("range_name"))
+
+
+def require_login(request: Request) -> None:
+    get_ctx(request)
 
 
 def mask_pii(value, show: bool, keep: int = 1):

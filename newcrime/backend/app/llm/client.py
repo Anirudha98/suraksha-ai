@@ -189,6 +189,8 @@ class CatalystClient(LLMClient):
 class OpenAIClient(LLMClient):
     """Slot for OpenAI. Falls back to mock until an API key is set."""
     provider = "openai"
+    # Same JSON-query contract as GLM; nlq runs the SQL against SQLite.
+    generate_query = CatalystClient.generate_query
 
     def __init__(self):
         self.available = bool(settings.openai_api_key)
@@ -199,7 +201,8 @@ class OpenAIClient(LLMClient):
             return ""
         try:
             from openai import OpenAI  # optional dependency
-            client = OpenAI(api_key=settings.openai_api_key)
+            client = OpenAI(api_key=settings.openai_api_key,
+                            base_url=settings.openai_base_url or None)
             resp = client.chat.completions.create(
                 model=settings.openai_model,
                 messages=[{"role": "system", "content": system},

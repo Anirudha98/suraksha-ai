@@ -1,23 +1,18 @@
 const BASE = (import.meta as any).env?.VITE_API_BASE || "/api";
 
-// Attach the signed-in officer's identity so the backend can enforce RBAC,
-// mask PII and write the audit trail. (Local prototype — a production build
-// would use a verified session token instead of headers.)
-function authHeaders(): Record<string, string> {
+// The signed token from /auth/login; the backend derives role, territory and
+// PII rights from it, so nothing the browser claims about itself is trusted.
+function token(): string {
   try {
-    const u = JSON.parse(localStorage.getItem("ci-user") || "null");
-    if (!u) return {};
-    return {
-      "X-User-Id": String(u.id ?? ""),
-      "X-User-Name": u.full_name ?? "",
-      "X-User-Role": u.role ?? "",
-      "X-User-District": u.district ?? "",
-      "X-User-Subdivision": u.subdivision ?? "",
-      "X-User-Range": u.range_name ?? "",
-    };
+    return JSON.parse(localStorage.getItem("ci-user") || "null")?.token || "";
   } catch {
-    return {};
+    return "";
   }
+}
+
+function authHeaders(): Record<string, string> {
+  const t = token();
+  return t ? { Authorization: `Bearer ${t}` } : {};
 }
 
 async function j<T = any>(path: string, opts?: RequestInit): Promise<T> {
@@ -25,6 +20,11 @@ async function j<T = any>(path: string, opts?: RequestInit): Promise<T> {
     ...opts,
     headers: { "Content-Type": "application/json", ...authHeaders(), ...(opts?.headers || {}) },
   });
+  if (res.status === 401 && !path.startsWith("/auth/")) {
+    // expired token or a session saved before tokens existed: back to login
+    localStorage.removeItem("ci-user");
+    location.reload();
+  }
   if (!res.ok) {
     const msg = await res.text().catch(() => res.statusText);
     throw new Error(`${res.status}: ${msg}`);
@@ -201,7 +201,9 @@ export const api = {
     const fd = new FormData(); fd.append("category", category); fd.append("file", file);
     return fetch(`/api/investigation/${caseId}/evidence`, { method: "POST", headers: authHeaders(), body: fd }).then((r) => r.json());
   },
-  evidenceDownloadUrl: (docId: number) => `/api/investigation/evidence/${docId}/download`,
+  // <a>/<img>/<iframe> can't send headers, so downloads carry the token in the URL
+  evidenceDownloadUrl: (docId: number) =>
+    `/api/investigation/evidence/${docId}/download?token=${encodeURIComponent(token())}`,
   deleteEvidence: (docId: number) => j(`/investigation/evidence/${docId}`, { method: "DELETE" }),
 
   // case-scoped chat

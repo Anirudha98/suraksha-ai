@@ -10,6 +10,7 @@ from faker import Faker
 
 from .database import Base, SessionLocal, engine
 from . import models as m
+from .deps import hash_password
 
 fake = Faker("en_IN")
 Faker.seed(42)
@@ -111,7 +112,7 @@ def seed(n_cases=260, n_accused=180, n_victims=200):
     ]
     for uname, name, role, badge, dist, subdiv, stn, rng in demo_users:
         db.add(m.User(username=uname, full_name=name, email=f"{uname}@ksp.gov.in",
-                      password="password", role=role, badge_number=badge, district=dist,
+                      password=hash_password("password"), role=role, badge_number=badge, district=dist,
                       subdivision=subdiv, station=stn, range_name=rng))
 
     # ── Officers ──

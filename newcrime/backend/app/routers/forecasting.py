@@ -12,7 +12,7 @@ router = APIRouter(prefix="/api/forecasting", tags=["forecasting"])
 @router.get("/predictions")
 def predictions(db: Session = Depends(get_db), risk_level: str | None = None,
                 crime_type: str | None = None, district: str | None = None):
-    if settings.quickml_endpoint_key:
+    if not settings.use_catalyst:
         from ..services.forecast import get_forecast
         forecast = get_forecast(crime_type=crime_type, district=district)
         if forecast:
@@ -33,7 +33,7 @@ def predictions(db: Session = Depends(get_db), risk_level: str | None = None,
                     "predicted_count": f["predicted_count"],
                     "lower_bound": f["lower_bound"],
                     "upper_bound": f["upper_bound"],
-                    "source": "quickml_prophet",
+                    "source": "trend_model",
                 })
             if results:
                 return results
